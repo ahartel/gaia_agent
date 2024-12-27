@@ -4,9 +4,7 @@ import os
 from pathlib import Path
 import re
 from brave import Brave
-from brave.types import WebSearchApiResponse
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-import requests
 from rich.console import Console
 from rich.panel import Panel
 from trafilatura import fetch_url, extract
@@ -29,6 +27,11 @@ def parse_args() -> argparse.Namespace:
         help="The model to use for generating new tasks",
         required=True,
     )
+    parser.add_argument(
+        "-t",
+        "--task",
+        help="The task to execute",
+        required=False	)
     return parser.parse_args()
 
 
@@ -36,9 +39,6 @@ def task_execution_prompt(task: str, done_tasks: Sequence[Tuple[str, str]]) -> s
     prompt = (
         """
 <|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-Environment: ipython
-Tools: brave_search
 
 # Tool Instructions
 - Always execute python code in messages that you share.
@@ -163,7 +163,11 @@ def extract_function_call(model_output: str) -> Optional[Tuple[str, Dict[str, An
         call = json.loads(match_json.group(1))
         return (call["name"], call["parameters"])
     else:
-        return None
+        try:
+            function = json.loads(model_output)
+            return (function["name"], function["parameters"])
+        except json.JSONDecodeError:
+            return None
 
 
 def execute_function_call(
@@ -202,8 +206,12 @@ def task_generation_prompt(
     prompt = f"""
 <|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
-You are a curious and helpful assistant whose job it is to instruct the user to solve an objective.
-You answer brief and without preamble and on a single line.
+You are a curious and helpful assistant whose job it is to solve an objective.
+The user can help you solve the objective by solving tasks which you give him.
+Use the user's responses to check all facts, don't assume any facts as they might be outdated.
+You only give the user one single task a time providing him with the necessary information to solve that task.
+You think step by step before giving the user its next task.
+On the last line of your response, answer briefly and without preamble on the last line.
 Once you have obtained enough information from the user to answer definitively the objective then suffix your answer by the word 'Done'.
 
 Your objective is: {objective}<|eot_id|>
@@ -234,7 +242,10 @@ def generate_task(
     prompt = task_generation_prompt(objective, done_tasks)
     console.print(Panel(prompt, title="Task generation prompt"))
     next_task = llm_completion(client, model, prompt)
-    console.print(Panel(next_task, title="Generated task"))
+    try:
+        console.print(Panel(next_task, title="Generated task"))
+    except:
+        print(next_task)
     return next_task
 
 
@@ -272,27 +283,28 @@ def execute_task(client: Client, console: Console, model: str, task: str) -> str
             raise ValueError(f"Invalid function call result: {turn}")
 
 
-def main_loop(
+def solve_single_objective(
     client: Client,
     console: Console,
-    args: argparse.Namespace,
+    model: str,
     objective: str,
 ) -> None:
     done_tasks: List[Tuple[str, str]] = []
-    initial_task = generate_task(client, console, args.model, objective, done_tasks)
+    initial_task = generate_task(client, console, model, objective, done_tasks)
     if initial_task == "Done":
         return None
     task_queue = [initial_task]
     results = {}
     while len(task_queue) > 0:
         task = task_queue.pop(0)
-        with console.status(f"Working on task: {task}") as status:
-            result = execute_task(client, console, args.model, task)
+        with console.status(f"Working on task: {task}") as _status:
+            # result = execute_task(client, console, model, task)
+            result = input()
             done_tasks.append((task, result))
 
         if result == "Done":
             break
-        new_task = generate_task(client, console, args.model, objective, done_tasks)
+        new_task = generate_task(client, console, model, objective, done_tasks)
         done = is_done(new_task)
         if done is not None:
             console.print(
@@ -306,14 +318,29 @@ def main_loop(
         task_queue.append(new_task)
         results[task] = result
 
+def solve_objectives(objectives: Sequence[str], client: Client, console: Console, model: str) -> None:
+    for line in objectives:
+        task = json.loads(line)
+        if task["Level"] == 1:
+            console.print(task["task_id"])
+            solve_single_objective(client, console, model, task["Question"])
+
+def solve_specific_objective(objectives: Sequence[str], client: Client, console: Console, model: str, objective_id: str) -> None:
+    for line in objectives:
+        task = json.loads(line)
+        if task["task_id"] == objective_id:
+            solve_single_objective(client, console, model, task["Question"])	
 
 def main() -> None:
     args = parse_args()
-    client = Client(os.environ["AA_API_TOKEN"])
-    objective = Path(args.objective).read_text()
+    client = Client(host="https://inference-api.product.pharia.com", token=os.environ["AA_API_TOKEN"])
+    objectives = Path(args.objective).read_text().split("\n")
     with open("debug.log ", "w") as report_file:
         console = Console(file=report_file)
-        main_loop(client, console, args, objective)
+        if args.task:
+            solve_specific_objective(objectives, client, console, args.model, args.task)
+        else:
+            solve_objectives(objectives, client, console, args.model)
 
 
 if __name__ == "__main__":
