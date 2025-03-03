@@ -56,7 +56,7 @@ def main_loop(client: Client, model: str, system_prompt: str, user_prompt: str) 
 def main() -> None:
     args = parse_args()
     client = Client(
-        host="https://legacy-api.aleph-alpha.com", token=os.environ["AA_API_TOKEN"]
+        host="https://inference-api.product.pharia.com", token=os.environ["AA_API_TOKEN"]
     )
     system_prompt = Path(args.system_prompt).read_text()
     user_prompt = Path(args.user_prompt).read_text()

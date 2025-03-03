@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-o",
         "--objective",
-        help="A file container the agent's object or its long-term goal",
+        help="A file containing the agent's object or its long-term goal",
         required=True,
     )
     parser.add_argument(
@@ -27,11 +27,7 @@ def parse_args() -> argparse.Namespace:
         help="The model to use for generating new tasks",
         required=True,
     )
-    parser.add_argument(
-        "-t",
-        "--task",
-        help="The task to execute",
-        required=False	)
+    parser.add_argument("-t", "--task", help="The task to execute", required=False)
     return parser.parse_args()
 
 
@@ -84,10 +80,27 @@ You have access to the following functions:
             "required": ["query", "num_results"]
         }
     }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "calculate",
+        "description": "Calculate the result of a mathematical expression. Can only do simple arithmetic with units. Cannot round.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "The mathematical expression to calculate"
+                }
+            },
+            "required": ["expression"]
+        }
+    }
 }
 ]
 
-You are a helpful assistant with tool calling capabilities. When you receive a tool call response, use the output to format an answer to the original use question and follow up on that answer by the word 'Done' on a new line.
+You are a helpful assistant with tool calling capabilities. When you receive a tool call response, use the output to format an answer to the original user question and follow up on that answer by the word 'Done' on a new line.
 
 Given the following functions, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.
 
@@ -171,12 +184,11 @@ def extract_function_call(model_output: str) -> Optional[Tuple[str, Dict[str, An
 
 
 def execute_function_call(
-    client: Client, console: Console, model: str, task: str, result: str
+    client: Client, model: str, task: str, result: str
 ) -> Optional[str]:
     def _call(function_name: str, parameters: dict) -> str:
         if function_name == "download_content":
             content = download_content(**parameters)
-            console.print(Panel(content, title="Downloaded content"))
             summary = summarize_content(client, model, task, content)
             return summary
         elif function_name == "brave_search":
@@ -189,6 +201,8 @@ def execute_function_call(
                 parameters["num_results"] = 10
 
             return brave_search(**parameters)
+        elif function_name == "calculate":
+            raise NotImplementedError("Calculate function is not implemented")
         else:
             raise ValueError(f"Invalid function call: {function_name}, {parameters}")
 
@@ -200,7 +214,7 @@ def execute_function_call(
         return _call(function_name, parameters)
 
 
-def task_generation_prompt(
+def task_generation_prompt_2(
     objective: str, done_tasks: Sequence[Tuple[str, str]]
 ) -> str:
     prompt = f"""
@@ -224,6 +238,35 @@ I want to help you solve your objective. What should I do next?<|eot_id|><|start
     return prompt
 
 
+def task_generation_prompt(
+    console: Console, objective: str, done_tasks: Sequence[Tuple[str, str]]
+) -> str:
+    system_prompt = """
+You are helpful assistant that wants to help the user answer his question.
+When the user asks you for help with his question you will guide him to the solution by giving him tasks to solve.
+You give the user one task at a time and once the user has provided all necessary information you will answer the user's question."""
+    user_prompt = f"""
+I would like to answer the following question, please help me with that. My question is:
+{objective}. What should I do next?"""
+
+    console.print(Panel(system_prompt, title="System Prompt"))
+    console.print(Panel(user_prompt, title="User Prompt"))
+
+    prompt = f"""
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+{system_prompt}
+<|eot_id|>
+<|start_header_id|>user<|end_header_id|>
+{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+"""
+    for task, summary in done_tasks:
+        console.print(Panel(task, title="Assistant Response"))
+        console.print(Panel(summary, title="User Response"))
+        prompt += f"{task}<|eot_id|><|start_header_id|>user<|end_header_id|>\n{summary}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+
+    return prompt
+
+
 def summarize_content(client: Client, model: str, task: str, content: str) -> str:
     prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 You are a helpful summarizing assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
@@ -239,8 +282,7 @@ def generate_task(
     objective: str,
     done_tasks: List[Tuple[str, str]],
 ) -> str:
-    prompt = task_generation_prompt(objective, done_tasks)
-    console.print(Panel(prompt, title="Task generation prompt"))
+    prompt = task_generation_prompt(console, objective, done_tasks)
     next_task = llm_completion(client, model, prompt)
     try:
         console.print(Panel(next_task, title="Generated task"))
@@ -249,7 +291,10 @@ def generate_task(
     return next_task
 
 
-def is_done(output: str) -> Optional[str]:
+def is_done(output: str, done_turns: List[str] = list()) -> Optional[str]:
+    if output == "Done":
+        return done_turns[-1]
+
     done_prefix_regex = re.compile(r"Done\n+(.*)", re.S)
     done_suffix_regex = re.compile(r"^(.*)\n*Done\.?", re.S)
     match_prefix = done_prefix_regex.match(output)
@@ -264,23 +309,19 @@ def is_done(output: str) -> Optional[str]:
 
 def execute_task(client: Client, console: Console, model: str, task: str) -> str:
     done_turns: List[Tuple[str, str]] = []
-    while True:
-        prompt = task_execution_prompt(task, done_turns)
-        console.print(Panel(prompt, title="Task execution prompt"))
 
-        turn = llm_completion(client, model, prompt)
-        console.print(Panel(turn, title="Task result"))
+    prompt = task_execution_prompt(task, done_turns)
 
-        done = is_done(turn)
-        if done is not None:
-            return done
+    turn = llm_completion(client, model, prompt)
 
-        function_call_result = execute_function_call(client, console, model, task, turn)
-        if function_call_result is not None:
-            console.print(Panel(function_call_result, title="Task result"))
-            done_turns.append((turn, function_call_result))
-        else:
-            raise ValueError(f"Invalid function call result: {turn}")
+    function_call_result = execute_function_call(client, model, task, turn)
+    if function_call_result is not None:
+        console.print(Panel(function_call_result, title="Task result"))
+        done_turns.append((turn, function_call_result))
+    else:
+        raise ValueError(f"Invalid function call result: {turn}")
+
+    return function_call_result
 
 
 def solve_single_objective(
@@ -297,13 +338,9 @@ def solve_single_objective(
     results = {}
     while len(task_queue) > 0:
         task = task_queue.pop(0)
-        with console.status(f"Working on task: {task}") as _status:
-            # result = execute_task(client, console, model, task)
-            result = input()
-            done_tasks.append((task, result))
+        result = execute_task(client, console, model, task)
+        done_tasks.append((task, result))
 
-        if result == "Done":
-            break
         new_task = generate_task(client, console, model, objective, done_tasks)
         done = is_done(new_task)
         if done is not None:
@@ -318,29 +355,45 @@ def solve_single_objective(
         task_queue.append(new_task)
         results[task] = result
 
-def solve_objectives(objectives: Sequence[str], client: Client, console: Console, model: str) -> None:
+
+def solve_objectives(
+    objectives: Sequence[str], client: Client, console: Console, model: str
+) -> None:
     for line in objectives:
         task = json.loads(line)
         if task["Level"] == 1:
             console.print(task["task_id"])
             solve_single_objective(client, console, model, task["Question"])
 
-def solve_specific_objective(objectives: Sequence[str], client: Client, console: Console, model: str, objective_id: str) -> None:
+
+def solve_specific_objective(
+    objectives: Sequence[str],
+    client: Client,
+    console: Console,
+    model: str,
+    objective_id: str,
+) -> None:
     for line in objectives:
         task = json.loads(line)
         if task["task_id"] == objective_id:
-            solve_single_objective(client, console, model, task["Question"])	
+            solve_single_objective(client, console, model, task["Question"])
+
 
 def main() -> None:
     args = parse_args()
-    client = Client(host="https://inference-api.product.pharia.com", token=os.environ["AA_API_TOKEN"])
+    client = Client(
+        host="https://inference-api.product.pharia.com",
+        token=os.environ["AA_API_TOKEN"],
+    )
     objectives = Path(args.objective).read_text().split("\n")
-    with open("debug.log ", "w") as report_file:
-        console = Console(file=report_file)
+    console = Console(record=True)
+    try:
         if args.task:
             solve_specific_objective(objectives, client, console, args.model, args.task)
         else:
             solve_objectives(objectives, client, console, args.model)
+    finally:
+        console.save_text("debug.log")
 
 
 if __name__ == "__main__":

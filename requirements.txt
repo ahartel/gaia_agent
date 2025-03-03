@@ -1,6 +1,0 @@
-trafilatura
-aleph_alpha_client
-rich
-brave-search
-types-requests
-requests
